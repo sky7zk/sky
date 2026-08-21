@@ -9,7 +9,17 @@
 - 阶段：Preliminary test - Photon dose on CT
 - GitHub仓库：<https://github.com/sky7zk/sky>
 
-## 第一步：登录 GitHub
+## 当前进度（2026-08-21）
+
+- GitHub CLI 已登录 `sky7zk`；
+- 提交代码已推送到 `codex/doserad-photon-ct-submission` 分支；
+- 草稿 PR：<https://github.com/sky7zk/sky/pull/1>；
+- 本地单元测试：`3 passed`；
+- `model.tar.gz` 已准备好，没有上传到公开 GitHub 仓库。
+
+你现在应从下面的“第三步”开始；第一、二步已完成。
+
+## 第一步：登录 GitHub（已完成）
 
 打开服务器终端，检查是否已有 GitHub CLI：
 
@@ -54,17 +64,19 @@ GitHub登录好了
 
 不要把 GitHub 密码、Token、Cookie或验证码发给我。
 
-## 第二步：让我推送代码
+## 第二步：推送代码（已完成）
 
-收到你“GitHub登录好了”的消息后，我会：
+已完成代码检查、测试和推送。模型权重、患者数据和本地测试数据均未上传。
 
-1. 再次检查提交代码；
-2. 提交本地变更；
-3. 推送到 `https://github.com/sky7zk/sky`；
-4. 检查 GitHub 页面上的文件；
-5. 确保没有上传患者数据、训练数据或模型权重。
+打开 <https://github.com/sky7zk/sky/pull/1>，检查后依次点击：
 
-你暂时不需要自己执行 `git add`、`git commit` 或 `git push`。
+```text
+Ready for review
+Merge pull request
+Confirm merge
+```
+
+合并后确认 <https://github.com/sky7zk/sky> 的 `main` 分支上能看到 `Dockerfile`。
 
 ## 第三步：加入 DoseRAD2026
 
@@ -205,18 +217,17 @@ Preliminary阶段允许查看日志。按以下顺序检查：
 
 ## 你现在只需要做什么
 
-现在先完成 GitHub CLI登录：
+按照以下顺序操作：
 
-```bash
-gh auth login
-gh auth status
-```
+1. 打开 <https://github.com/sky7zk/sky/pull/1> 并合并到 `main`；
+2. 从本文档第三步开始，加入 DoseRAD2026；
+3. 创建 Photon CT Preliminary Algorithm；
+4. 连接 `sky7zk/sky` 的 `main` 分支并等待 Container 变为 `Active`；
+5. 上传服务器上的 `model.tar.gz`；
+6. 容器和模型都就绪后，创建第一次 Preliminary Submission。
 
-完成后告诉我：
+如果你不想自己点击合并，直接告诉我：
 
 ```text
-GitHub登录好了
+帮我合并PR
 ```
-
-我会继续推送代码。之后你再按照本文档第三步开始操作 Grand Challenge 网页。
-
