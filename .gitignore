@@ -1,0 +1,10 @@
+*.tar.gz
+*.tar
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+test/output/
+test/input/
+model/*.pth
+model/*.json
+!model/README.md
