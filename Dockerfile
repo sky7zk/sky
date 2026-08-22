@@ -3,7 +3,7 @@ FROM --platform=linux/amd64 pytorch/pytorch:2.9.1-cuda12.6-cudnn9-runtime
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    DOSERAD_BATCH_SIZE=2
+    DOSERAD_BATCH_SIZE=1
 
 RUN groupadd --system user && useradd --create-home --no-log-init --system --gid user user
 
@@ -20,4 +20,3 @@ USER user
 LABEL org.grand-challenge.api-method="invoke"
 
 ENTRYPOINT ["python", "app.py"]
-

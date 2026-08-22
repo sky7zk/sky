@@ -82,6 +82,29 @@ def test_write_and_audit_outputs(tmp_path: Path):
         inference.INPUT_PATH = old_input
 
 
+def test_streamed_mha_stack_preserves_frames_and_geometry(tmp_path: Path):
+    reference = sitk.Image([3, 4, 5], sitk.sitkFloat32)
+    reference.SetSpacing((2.0, 3.0, 4.0))
+    reference.SetOrigin((10.0, 20.0, 30.0))
+    reference.SetDirection((0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0))
+    first = np.arange(60, dtype=np.float32).reshape(3, 4, 5)
+    second = first + 100.0
+    path = tmp_path / "output.mha"
+
+    writer = inference._MhaStackWriter(path, reference, frame_count=2)
+    writer.write(first)
+    writer.write(second)
+    writer.close()
+
+    image = sitk.ReadImage(str(path))
+    array_tzyx = sitk.GetArrayFromImage(image)
+    assert image.GetSize() == (3, 4, 5, 2)
+    assert image.GetSpacing()[:3] == reference.GetSpacing()
+    assert image.GetOrigin()[:3] == reference.GetOrigin()
+    assert np.array_equal(array_tzyx[0], np.transpose(first, (2, 1, 0)))
+    assert np.array_equal(array_tzyx[1], np.transpose(second, (2, 1, 0)))
+
+
 def test_reject_duplicate_output_position():
     metadata = sample_metadata()
     duplicate = json.loads(json.dumps(metadata[0]["beams"][0]["control_points"][0]))

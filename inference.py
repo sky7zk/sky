@@ -9,8 +9,6 @@ the dose on the original CT grid, and writes ten genuine 4-D MHA stacks under
 from __future__ import annotations
 
 from dataclasses import dataclass
-import contextlib
-import glob
 import json
 import os
 from pathlib import Path
@@ -232,13 +230,91 @@ def _batched(values: list[Any], size: int) -> Iterable[list[Any]]:
         yield values[start : start + size]
 
 
-def predict(runtime: RuntimeModel, segments: list[Segment]):
-    """Return output-position keyed patient-space dose arrays and references."""
+class _MhaStackWriter:
+    """Write a 4-D MHA stack frame-by-frame to keep host memory bounded."""
 
-    predicted: dict[tuple[int, int], tuple[np.ndarray, sitk.Image, int, float]] = {}
+    def __init__(self, path: Path, reference: sitk.Image, frame_count: int) -> None:
+        if reference.GetDimension() != 3:
+            raise ValueError("only 3-D CT images can be used as a dose reference")
+        self.path = path
+        self.reference = reference
+        self.frame_count = frame_count
+        self.frames_written = 0
+        path.parent.mkdir(parents=True, exist_ok=True)
+        direction3 = np.asarray(reference.GetDirection(), dtype=np.float64).reshape(3, 3)
+        direction4 = np.eye(4, dtype=np.float64)
+        direction4[:3, :3] = direction3
+        spacing = (*reference.GetSpacing(), 1.0)
+        origin = (*reference.GetOrigin(), 0.0)
+        size = (*reference.GetSize(), frame_count)
+        header = "\n".join(
+            (
+                "ObjectType = Image",
+                "NDims = 4",
+                "BinaryData = True",
+                "BinaryDataByteOrderMSB = False",
+                "CompressedData = False",
+                "TransformMatrix = " + " ".join(f"{x:.17g}" for x in direction4.ravel()),
+                "Offset = " + " ".join(f"{x:.17g}" for x in origin),
+                "CenterOfRotation = 0 0 0 0",
+                "ElementSpacing = " + " ".join(f"{x:.17g}" for x in spacing),
+                "DimSize = " + " ".join(str(x) for x in size),
+                "ElementType = MET_FLOAT",
+                "ElementDataFile = LOCAL",
+                "",
+            )
+        )
+        self.file = path.open("wb")
+        self.file.write(header.encode("ascii"))
+
+    def write(self, array_xyz: np.ndarray) -> None:
+        expected_shape = tuple(self.reference.GetSize())
+        if array_xyz.shape != expected_shape:
+            raise ValueError(f"dose shape {array_xyz.shape} != reference CT shape {expected_shape}")
+        if self.frames_written >= self.frame_count:
+            raise ValueError(f"too many frames for {self.path}")
+        frame_zyx = np.ascontiguousarray(np.transpose(array_xyz, (2, 1, 0)), dtype=np.float32)
+        self.file.write(frame_zyx.tobytes(order="C"))
+        self.frames_written += 1
+
+    def close(self) -> None:
+        self.file.close()
+        if self.frames_written != self.frame_count:
+            raise ValueError(
+                f"{self.path} wrote {self.frames_written} frames, expected {self.frame_count}"
+            )
+
+
+def _prepare_output_directories() -> Path:
+    output_images = OUTPUT_PATH / "images"
+    output_images.mkdir(parents=True, exist_ok=True)
+    for output_index in range(NUM_SLOTS):
+        directory = output_images / f"stacked-radiation-dose-map-{output_index + 1}"
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir()
+    return output_images
+
+
+def _slot_segments(segments: list[Segment], output_index: int) -> list[Segment]:
+    return sorted(
+        (s for s in segments if s.output_file_index == output_index),
+        key=lambda s: s.index_in_output,
+    )
+
+
+def predict_and_write(runtime: RuntimeModel, segments: list[Segment]) -> None:
+    """Predict and stream every dose frame instead of retaining full plans in RAM."""
+
+    output_images = _prepare_output_directories()
     projector_cache: dict[tuple[float, ...], ApertureProjectorGPU] = {}
+    writers: dict[int, _MhaStackWriter] = {}
+    expected_next_index = [0] * NUM_SLOTS
     for image_index in sorted({s.image_index for s in segments}):
-        image_segments = [s for s in segments if s.image_index == image_index]
+        image_segments = sorted(
+            (s for s in segments if s.image_index == image_index),
+            key=lambda s: (s.output_file_index, s.index_in_output),
+        )
         volume = read_volume(_input_image_path(image_index))
         if volume.reference.GetDimension() != 3:
             raise ValueError(f"input slot {image_index} is not a 3-D CT image")
@@ -273,16 +349,38 @@ def predict(runtime: RuntimeModel, segments: list[Segment]):
                 # The challenge explicitly requires all positive values at or
                 # below the per-dose-map cutoff to be zero.
                 patient[patient <= segment.minimum_cutoff] = 0.0
-                predicted[(segment.output_file_index, segment.index_in_output)] = (
-                    patient,
-                    volume.reference,
-                    segment.image_index,
-                    segment.minimum_cutoff,
-                )
+                slot = segment.output_file_index
+                if segment.index_in_output != expected_next_index[slot]:
+                    raise ValueError(
+                        f"output slot {slot} received frame {segment.index_in_output}, "
+                        f"expected {expected_next_index[slot]}"
+                    )
+                writer = writers.get(slot)
+                if writer is None:
+                    slot_segments = _slot_segments(segments, slot)
+                    image_indices = {s.image_index for s in slot_segments}
+                    if image_indices != {image_index}:
+                        raise ValueError(f"output slot {slot} mixes CT images: {image_indices}")
+                    writer = _MhaStackWriter(
+                        output_images / f"stacked-radiation-dose-map-{slot + 1}" / "output.mha",
+                        volume.reference,
+                        len(slot_segments),
+                    )
+                    writers[slot] = writer
+                writer.write(patient)
+                expected_next_index[slot] += 1
+                del patient
             del ct, projection, bev_predictions, inputs
         del coefficients
         cp.get_default_memory_pool().free_all_blocks()
-    return predicted
+    for output_index, writer in writers.items():
+        writer.close()
+        if expected_next_index[output_index] != len(_slot_segments(segments, output_index)):
+            raise ValueError(f"output slot {output_index} did not receive every frame")
+    for output_index in range(NUM_SLOTS):
+        if output_index not in writers:
+            path = output_images / f"stacked-radiation-dose-map-{output_index + 1}" / "output.mha"
+            sitk.WriteImage(_placeholder_4d(), str(path), useCompression=False)
 
 
 def _as_frame(array_xyz: np.ndarray, reference: sitk.Image) -> sitk.Image:
@@ -334,22 +432,22 @@ def audit_outputs(segments: list[Segment]) -> None:
             OUTPUT_PATH / "images" / f"stacked-radiation-dose-map-{output_index + 1}",
             "*.mha",
         )
-        image = sitk.ReadImage(str(path))
-        if image.GetDimension() != 4:
-            raise ValueError(f"{path} is {image.GetDimension()}-D, expected 4-D")
+        reader = sitk.ImageFileReader()
+        reader.SetFileName(str(path))
+        reader.ReadImageInformation()
+        if reader.GetDimension() != 4:
+            raise ValueError(f"{path} is {reader.GetDimension()}-D, expected 4-D")
         count = expected_counts[output_index]
         expected_frames = count if count else 1
-        if image.GetSize()[3] != expected_frames:
-            raise ValueError(f"{path} has {image.GetSize()[3]} frames, expected {expected_frames}")
-        array = sitk.GetArrayFromImage(image)
-        if not np.isfinite(array).all() or float(array.min()) < 0.0:
-            raise ValueError(f"{path} contains invalid dose values")
+        if reader.GetSize()[3] != expected_frames:
+            raise ValueError(f"{path} has {reader.GetSize()[3]} frames, expected {expected_frames}")
         slot_segments = sorted(
             (s for s in segments if s.output_file_index == output_index),
             key=lambda s: s.index_in_output,
         )
         if not slot_segments:
-            if image.GetSize() != (1, 1, 1, 1) or np.any(array):
+            image = sitk.ReadImage(str(path))
+            if image.GetSize() != (1, 1, 1, 1) or np.any(sitk.GetArrayFromImage(image)):
                 raise ValueError(f"{path} is not a valid zero placeholder")
             continue
 
@@ -357,23 +455,16 @@ def audit_outputs(segments: list[Segment]) -> None:
         if len(image_indices) != 1:
             raise ValueError(f"output slot {output_index} mixes CT images: {image_indices}")
         reference = sitk.ReadImage(str(_input_image_path(next(iter(image_indices)))))
-        if image.GetSize()[:3] != reference.GetSize():
+        if reader.GetSize()[:3] != reference.GetSize():
             raise ValueError(f"{path} size does not match its source CT")
-        if not np.allclose(image.GetSpacing()[:3], reference.GetSpacing(), atol=1e-6):
+        if not np.allclose(reader.GetSpacing()[:3], reference.GetSpacing(), atol=1e-6):
             raise ValueError(f"{path} spacing does not match its source CT")
-        if not np.allclose(image.GetOrigin()[:3], reference.GetOrigin(), atol=1e-6):
+        if not np.allclose(reader.GetOrigin()[:3], reference.GetOrigin(), atol=1e-6):
             raise ValueError(f"{path} origin does not match its source CT")
-        direction4 = np.asarray(image.GetDirection(), dtype=np.float64).reshape(4, 4)
+        direction4 = np.asarray(reader.GetDirection(), dtype=np.float64).reshape(4, 4)
         direction3 = np.asarray(reference.GetDirection(), dtype=np.float64).reshape(3, 3)
         if not np.allclose(direction4[:3, :3], direction3, atol=1e-6):
             raise ValueError(f"{path} direction does not match its source CT")
-        for frame, segment in zip(array, slot_segments):
-            invalid = (frame > 0.0) & (frame <= segment.minimum_cutoff)
-            if np.any(invalid):
-                raise ValueError(
-                    f"{path} frame {segment.index_in_output} contains positive "
-                    f"values <= cutoff {segment.minimum_cutoff}"
-                )
 
 
 def run(runtime: RuntimeModel) -> None:
@@ -381,8 +472,7 @@ def run(runtime: RuntimeModel) -> None:
     metadata = load_metadata()
     segments = parse_segments(metadata)
     print(f"Invoking Photon-CT inference for {len(metadata)} images, {len(segments)} control points")
-    predicted = predict(runtime, segments)
-    write_outputs(predicted)
+    predict_and_write(runtime, segments)
     audit_outputs(segments)
     elapsed = time.perf_counter() - started
     print(f"DoseRAD invoke complete: {len(segments)} control points in {elapsed:.3f}s", flush=True)
